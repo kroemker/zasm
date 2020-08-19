@@ -54,6 +54,7 @@ errors.INVALID_BASEOFFSET_PAIR = 0x03
 errors.INVALID_COMMAND = 0x04
 errors.INVALID_VALUE = 0x05
 errors.NO_COMMAND_FOUND = 0x06
+errors.INVALID_USE_OF_HI_LO = 0x07
 
 local warnids = {}
 
@@ -64,10 +65,12 @@ warnids.UNABLE_TO_OPEN_FILE = 0x02
 local fns = {}
 local warnings = {}
 local isError = false
+local useRom = false
 
 local function throw(errid, msg, caller)
 	isError = true
 	print(caller .. ": " .. msg .. " (Error " .. errid .. ")")
+    printWarnings()
     os.exit()
 end
 
@@ -1111,6 +1114,12 @@ end
 
 local jumpLabels = {}
 
+function printWarnings()
+    for k,v in pairs(warnings) do
+        print("Warning " .. v.id .. ": " .. v.msg .. " @ " .. v.caller)
+    end
+end
+
 local function getHexString(value, digits)
     local hex = {"0","1","2","3","4","5","6","7","8","9","A","B","C","D","E","F"}
     local str = ""
@@ -1153,6 +1162,11 @@ local function getRegOrNil(token) -- expects "$" and then a number of reg
 	end
 end
 
+local function getHiLoArgument(token)
+    local label = string.match(token, "%w%(([%w$_]+)%)")
+	return label
+end
+
 local function getBaseOffsetOrNil(token)
 	local offset, base = string.match(token, "([%xx]+)%(([%w$]+)%)")
 	return base, offset
@@ -1170,15 +1184,25 @@ end
 local function assembleLine(line, address)
 	local tokens = {}
 	local i = 1
-	for tok in string.gmatch(line, "[%w$();_#]+") do
+	for tok in string.gmatch(line, "[%w$();._#%%]+") do
 		tokens[i] = tok
 		i = i + 1
 	end
+    
 	-- check for function name
 	if tokens[1] == nil then
 		throw(errors.NO_COMMAND_FOUND, "No command found in \"" .. tokens[1] .. "\"", "ZASM")
 		return -1
 	end
+    
+    -- handle .word
+    if string.lower(tokens[1]) == ".word" then
+        if tokens[2] and tonumber(tokens[2]) then
+            return tonumber(tokens[2])
+        else
+            warn(warnids.INVALID_FORMAT, "Invalid format for an assembler command! Command skipped!", tokens[1])
+        end
+    end
     
 	local fn_name = "mips_" .. string.lower(tokens[1])
 	-- check if the function is valid
@@ -1195,6 +1219,28 @@ local function assembleLine(line, address)
 		local labaddr = getJumpLabelAddressOrNil(tokens[i])
 		if labaddr then -- jump label
 			numargs[j] = labaddr
+        elseif string.sub(tokens[i], 1, 3) == "%hi" or string.sub(tokens[i], 1, 3) == "%lo" then -- load high/low of jump label
+            local hiLabel = getHiLoArgument(tokens[i])
+            if hiLabel then
+                local addr = getJumpLabelAddressOrNil(hiLabel)
+                if addr == nil then
+                    if tonumber(hiLabel) then 
+                        addr = tonumber(hiLabel)
+                    else
+                        throw(errors.INVALID_VALUE, "Invalid value \"" .. hiLabel .. "\"", tokens[1])
+                        return -1
+                    end
+                end
+                
+                if string.sub(tokens[i], 1, 3) == "%hi" then
+                    numargs[j] = bit.rshift(addr, 16)
+                else
+                    numargs[j] = bit.band(addr, 0xFFFF)
+                end
+			else
+				throw(errors.INVALID_USE_OF_HI_LO, "Invalid use of %hi/%lo \"" .. tokens[i] .. "\"", tokens[1])
+				return -1
+			end
 		elseif registers[string.upper(tokens[i])] ~= nil or registers[string.upper(string.sub(tokens[i], 2))] ~= nil then -- $ register
 			local r = getRegOrNil(tokens[i])
 			if r then
@@ -1253,12 +1299,14 @@ local function resolveJumpLabels(code)
             elseif string.lower(tokens[1]) == ".rom" then
                 if tokens[2] and tonumber("0x" .. tokens[2]) then
                     rom = tonumber("0x" .. tokens[2])
+                    useRom = true
                 else
                     warn(warnids.INVALID_FORMAT, "Invalid format for an assembler command! Command skipped!", tokens[1])
                 end
             elseif string.lower(tokens[1]) == ".file" then
                 if tokens[2] then
                     romFile = tokens[2]
+                    useRom = true
                 else
                     warn(warnids.INVALID_FORMAT, "Invalid format for an assembler command! Command skipped!", tokens[1])
                 end
@@ -1272,6 +1320,19 @@ local function resolveJumpLabels(code)
                     --addr = addr + 0x04
                 end
                 table.insert(jumpLabels, label)
+            elseif tokens[1] and string.lower(tokens[1]) == ".word" then -- parse line words
+                local t = 2
+                while tokens[t] do
+                    local codeLine = {}
+                    codeLine.string = ".word " .. tokens[t]
+                    codeLine.address = addr
+                    codeLine.rom = rom
+                    codeLine.romFile = romFile
+                    table.insert(codeLines, codeLine)
+                    addr = addr + 0x04
+                    rom = rom + 0x04
+                    t = t + 1
+                end
             elseif tokens[1] and string.byte(tokens[1]) ~= commentChar then -- if not an empty or comment line (and also no jumpLabel line)
                 local codeLine = {}
                 codeLine.string = v
@@ -1292,8 +1353,13 @@ function assemble(code)
 	local asm = {}
 	local cl = resolveJumpLabels(code)
     print()
-	print("ROM      | RAM      | OPCODE")
-    print("------------------------------")
+    if useRom then
+        print("ROM      | RAM      | OPCODE")
+        print("------------------------------")
+    else
+        print("RAM      | OPCODE")
+        print("-------------------")
+    end
 	for k,v in ipairs(cl) do
 		local opc = assembleLine(v.string, v.address)
 		local asmEntry = {}
@@ -1302,7 +1368,11 @@ function assemble(code)
 		asmEntry.romAddress = v.rom
         asmEntry.romFile = v.romFile
 		if opc >= 0 then
-			print(getHexString(v.rom, 8) .. " | " .. getHexString(v.address, 8) .. " | " .. getHexString(opc, 8))
+            if useRom then
+                print(getHexString(v.rom, 8) .. " | " .. getHexString(v.address, 8) .. " | " .. getHexString(opc, 8))
+            else
+                print(getHexString(v.address, 8) .. " | " .. getHexString(opc, 8))
+            end
 		else
 			opc = fns.mips_nop()
 		end
@@ -1436,6 +1506,4 @@ if outname ~= "" then
     writeOutputFile(outname, outcode)
 end
 
-for k,v in pairs(warnings) do
-    print("Warning " .. v.id .. ": " .. v.msg .. " @ " .. v.caller)
-end
+printWarnings()
